@@ -1,30 +1,54 @@
 #include "matching.hpp"
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cmath>
-#include <sstream>
-#include <iomanip>
+#include <cstring>
 
 namespace asgard {
+
+// ---------------------------------------------------------------------------
+// make_trade_id  — replaces std::ostringstream with std::to_chars
+//
+// Produces "T-XXXXXXXX" (zero-padded to 8 digits).
+// std::to_chars is locale-free and allocation-free; the 10-char result fits
+// within the SSO buffer of std::string so no heap allocation occurs.
+// ---------------------------------------------------------------------------
+
+static std::string make_trade_id(uint64_t n) {
+    char buf[11];          // "T-" + 8 digits + null
+    buf[0] = 'T';
+    buf[1] = '-';
+
+    // Write digits right-to-left into a temporary region, then memmove.
+    char* const field_beg = buf + 2;
+    char* const field_end = buf + 10;
+    auto [ptr, ec] = std::to_chars(field_beg, field_end, n);
+    (void)ec;
+
+    int digits = static_cast<int>(ptr - field_beg);
+    int pad    = 8 - digits;
+    if (pad > 0) {
+        std::memmove(field_beg + pad, field_beg,
+                     static_cast<std::size_t>(digits));
+        std::memset(field_beg, '0', static_cast<std::size_t>(pad));
+    }
+
+    return std::string(buf, 10);   // SSO: no heap allocation
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-static std::string make_trade_id(uint64_t n) {
-    std::ostringstream oss;
-    oss << "T-" << std::setfill('0') << std::setw(8) << n;
-    return oss.str();
-}
-
-// Non-const access to accounts_ is needed for margin adjustments.
-// We hold a const& in the header for the general case; for mutations we
-// cast away const (the accounts map is logically owned by the engine).
+// Non-const access to accounts_ (held const& to express non-ownership;
+// mutated for margin and fill accounting).
 static UserAccount& mutable_account(
     const std::unordered_map<std::string, UserAccount>& accounts,
     const std::string& user_id)
 {
-    return const_cast<std::unordered_map<std::string, UserAccount>&>(accounts).at(user_id);
+    return const_cast<std::unordered_map<std::string, UserAccount>&>(accounts)
+               .at(user_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -35,7 +59,7 @@ bool MatchingEngine::violates_impact_band(double fill_price,
                                            double arrival_best,
                                            OrderSide aggressive_side) const {
     if (arrival_best <= 0.0) return false;
-    double band = inst_.impact_band_pct;
+    const double band = inst_.impact_band_pct;
     if (aggressive_side == OrderSide::BUY)
         return fill_price > arrival_best * (1.0 + band) + 1e-9;
     else
@@ -44,6 +68,10 @@ bool MatchingEngine::violates_impact_band(double fill_price,
 
 // ---------------------------------------------------------------------------
 // handle_stp
+//
+// SAFETY: for CANCEL_RESTING and CANCEL_BOTH the resting node is erased from
+// the LevelList by book_.remove_order().  All fields we need from `resting`
+// are therefore saved into locals BEFORE the removal call.
 // ---------------------------------------------------------------------------
 
 bool MatchingEngine::handle_stp(Order& incoming, Order& resting,
@@ -52,24 +80,33 @@ bool MatchingEngine::handle_stp(Order& incoming, Order& resting,
     switch (incoming.stp_mode) {
         case STPMode::CANCEL_INCOMING:
             incoming.status = OrderStatus::CANCELLED;
-            return false;  // stop matching
+            return false;
 
         case STPMode::CANCEL_RESTING: {
-            // Remove resting order from the book, release its margin
-            release_order_margin(resting_user, resting, resting.remaining_qty);
-            resting.status = OrderStatus::CANCELLED;
-            book_.remove_order(resting.order_id, resting.price, resting.side);
-            resting_user.open_orders.erase(resting.order_id);
-            return true;   // continue matching (resting removed)
+            // Save before list::erase() invalidates the reference.
+            const std::string id  = resting.order_id;
+            const double      qty = resting.remaining_qty;
+            const double      px  = resting.price;
+            const OrderSide   sd  = resting.side;
+
+            release_order_margin(resting_user, resting, qty);
+            book_.remove_order(id, px, sd);        // may erase the list node
+            resting_user.open_orders.erase(id);
+            return true;    // continue matching; fetch fresh front next iteration
         }
 
-        case STPMode::CANCEL_BOTH:
+        case STPMode::CANCEL_BOTH: {
             incoming.status = OrderStatus::CANCELLED;
-            release_order_margin(resting_user, resting, resting.remaining_qty);
-            resting.status = OrderStatus::CANCELLED;
-            book_.remove_order(resting.order_id, resting.price, resting.side);
-            resting_user.open_orders.erase(resting.order_id);
-            return false;  // stop matching
+            const std::string id  = resting.order_id;
+            const double      qty = resting.remaining_qty;
+            const double      px  = resting.price;
+            const OrderSide   sd  = resting.side;
+
+            release_order_margin(resting_user, resting, qty);
+            book_.remove_order(id, px, sd);        // may erase the list node
+            resting_user.open_orders.erase(id);
+            return false;
+        }
     }
     return false;
 }
@@ -78,12 +115,13 @@ bool MatchingEngine::handle_stp(Order& incoming, Order& resting,
 // make_trade
 // ---------------------------------------------------------------------------
 
-Trade MatchingEngine::make_trade(const Order& incoming, const Order& resting, double fill_qty) {
+Trade MatchingEngine::make_trade(const Order& incoming, const Order& resting,
+                                  double fill_qty) {
     Trade t;
     ++trade_seq_;
     t.trade_id     = make_trade_id(trade_seq_);
     t.instrument   = incoming.instrument;
-    t.price        = resting.price;  // fills always at the resting (passive) price
+    t.price        = resting.price;    // fills at the passive (resting) price
     t.quantity     = fill_qty;
     t.timestamp_us = now_us();
 
@@ -106,47 +144,58 @@ Trade MatchingEngine::make_trade(const Order& incoming, const Order& resting, do
 }
 
 // ---------------------------------------------------------------------------
-// release_order_margin
+// release_order_margin / reserve_order_margin
 // ---------------------------------------------------------------------------
 
 void MatchingEngine::release_order_margin(UserAccount& user,
                                            const Order& o, double qty) {
     if (qty <= 0.0) return;
-    double ref  = (o.price > 0.0) ? o.price : 0.0;
-    double notional = qty * ref;
-    double im   = calc_im(notional, inst_);
+    const double ref     = (o.price > 0.0) ? o.price : 0.0;
+    const double notional = qty * ref;
+    const double im       = calc_im(notional, inst_);
     user.open_order_margin = std::max(0.0, user.open_order_margin - im);
 }
 
-// ---------------------------------------------------------------------------
-// reserve_order_margin
-// ---------------------------------------------------------------------------
-
 void MatchingEngine::reserve_order_margin(UserAccount& user,
                                            const Order& o, double mark_price) {
-    double ref = (o.price > 0.0) ? o.price : mark_price;
-    double notional = o.remaining_qty * ref;
-    double im = calc_im(notional, inst_);
+    const double ref      = (o.price > 0.0) ? o.price : mark_price;
+    const double notional = o.remaining_qty * ref;
+    const double im       = calc_im(notional, inst_);
     user.open_order_margin += im;
 }
 
 // ---------------------------------------------------------------------------
-// try_match  — walk opposite book and fill
+// try_match  — core matching hot path
+//
+// Optimisations vs. the prior implementation:
+//
+//  1. best_level_ptr()      One map operation per iteration instead of
+//                           best_ask() + peek_front(price) (two lookups).
+//
+//  2. consume_level_front() On level exhaustion calls erase(begin()) instead
+//                           of find(price) + erase.  For partial fills, zero
+//                           map operations.
+//
+//  3. Order& resting        Reference into the list node, not a copy (~200 B).
+//                           Fields needed after consumption are saved to
+//                           stack locals before consume_level_front().
+//
+//  4. trades.reserve(8)     Avoids reallocations for typical sweep depth.
 // ---------------------------------------------------------------------------
 
-std::vector<Trade> MatchingEngine::try_match(Order& incoming, double mark_price) {
+std::vector<Trade> MatchingEngine::try_match(Order& incoming,
+                                               double /*mark_price*/) {
     std::vector<Trade> trades;
+    trades.reserve(8);
 
     while (incoming.remaining_qty > 1e-9) {
-        // Get best price on the opposite side
-        std::optional<double> best_opt;
-        if (incoming.side == OrderSide::BUY)  best_opt = book_.best_ask();
-        else                                    best_opt = book_.best_bid();
 
-        if (!best_opt) break; // empty opposite book
-        double best_price = *best_opt;
+        // 1. Get best level and its price in a single map operation.
+        double      best_price = 0.0;
+        PriceLevel* lvl        = book_.best_level_ptr(incoming.side, best_price);
+        if (!lvl) break;
 
-        // Does the incoming order cross?
+        // 2. Price cross check.
         bool crosses;
         if (incoming.type == OrderType::MARKET) {
             crosses = true;
@@ -157,61 +206,57 @@ std::vector<Trade> MatchingEngine::try_match(Order& incoming, double mark_price)
         }
         if (!crosses) break;
 
-        // Layer 2: impact band check
+        // 3. Layer 2: impact band.
         if (violates_impact_band(best_price, incoming.arrival_best, incoming.side))
             break;
 
-        // Get front of the level (FIFO head)
-        Order* resting_ptr = book_.peek_front(incoming.side, best_price);
-        if (!resting_ptr) break;
-        Order resting_copy = *resting_ptr; // copy for STP check
+        // 4. Get a direct reference to the FIFO head order — no copy.
+        Order& resting = lvl->orders.front();
 
-        // STP check
-        if (resting_copy.user_id == incoming.user_id) {
+        // 5. STP check.  handle_stp saves resting fields before any removal.
+        if (resting.user_id == incoming.user_id) {
             auto& inc_user = mutable_account(accounts_, incoming.user_id);
-            auto& rst_user = mutable_account(accounts_, resting_copy.user_id);
-            bool cont = handle_stp(incoming, resting_copy, inc_user, rst_user);
+            auto& rst_user = mutable_account(accounts_, resting.user_id);
+            bool cont = handle_stp(incoming, resting, inc_user, rst_user);
             if (!cont) break;
-            // If CANCEL_RESTING, the resting was removed; loop to find the next order
-            continue;
+            continue;    // resting removed; re-fetch best front next iteration
         }
 
-        // Reduce-only constraint on incoming
+        // 6. Reduce-only constraint on the incoming order.
         double max_fill_qty = incoming.remaining_qty;
         if (incoming.reduce_only) {
-            auto it = accounts_.find(incoming.user_id);
-            if (it != accounts_.end()) {
-                auto pos_it = it->second.positions.find(incoming.instrument);
-                if (pos_it != it->second.positions.end()) {
-                    max_fill_qty = std::min(max_fill_qty, pos_it->second.size);
-                } else {
-                    max_fill_qty = 0.0; // no position to reduce
-                }
+            auto acct_it = accounts_.find(incoming.user_id);
+            if (acct_it != accounts_.end()) {
+                auto pos_it = acct_it->second.positions.find(incoming.instrument);
+                max_fill_qty = (pos_it != acct_it->second.positions.end())
+                    ? std::min(max_fill_qty, pos_it->second.size)
+                    : 0.0;
             }
         }
         if (max_fill_qty < 1e-9) break;
 
-        double fill_qty = std::min(max_fill_qty, resting_copy.remaining_qty);
+        const double fill_qty = std::min(max_fill_qty, resting.remaining_qty);
 
-        // Create trade
-        Trade t = make_trade(incoming, resting_copy, fill_qty);
-        trades.push_back(t);
+        // 7. Emit trade.  Reads resting fields; safe before consume_level_front.
+        trades.push_back(make_trade(incoming, resting, fill_qty));
 
-        // Update quantities
+        // 8. Save resting metadata BEFORE consume_level_front may erase the node.
+        auto&             resting_user  = mutable_account(accounts_, resting.user_id);
+        const bool        fully_filled  = (fill_qty >= resting.remaining_qty - 1e-9);
+        const std::string rst_oid       = resting.order_id;
+
+        release_order_margin(resting_user, resting, fill_qty);
+
+        // 9. Consume from book.  For full fill, erases the list node (resting
+        //    reference is dangling after this call for a fully-filled order).
+        book_.consume_level_front(incoming.side, lvl, fill_qty);
         incoming.remaining_qty -= fill_qty;
 
-        // Consume from book (FIFO: remove from front of level)
-        book_.consume_front(incoming.side, best_price, fill_qty);
-
-        // Release open_order_margin from the resting order (for the filled portion)
-        auto& resting_user = mutable_account(accounts_, resting_copy.user_id);
-        release_order_margin(resting_user, resting_copy, fill_qty);
-        if (fill_qty >= resting_copy.remaining_qty - 1e-9) {
-            // Fully filled
-            resting_user.open_orders.erase(resting_copy.order_id);
+        // 10. Sync resting user's open_orders.
+        if (fully_filled) {
+            resting_user.open_orders.erase(rst_oid);
         } else {
-            // Partially filled — update in open_orders map
-            auto& oo = resting_user.open_orders[resting_copy.order_id];
+            auto& oo = resting_user.open_orders[rst_oid];
             oo.remaining_qty -= fill_qty;
             oo.status = OrderStatus::PARTIAL;
         }
@@ -225,7 +270,7 @@ std::vector<Trade> MatchingEngine::try_match(Order& incoming, double mark_price)
 // ---------------------------------------------------------------------------
 
 std::vector<Trade> MatchingEngine::process(Order& incoming, double mark_price) {
-    // Record arrival best price (for Layer 2 impact band)
+    // Record the arrival best price for Layer 2 impact band.
     if (incoming.side == OrderSide::BUY) {
         auto ba = book_.best_ask();
         incoming.arrival_best = ba ? *ba : 0.0;
@@ -236,16 +281,16 @@ std::vector<Trade> MatchingEngine::process(Order& incoming, double mark_price) {
 
     auto& user = mutable_account(accounts_, incoming.user_id);
 
-    // ---------- POST_ONLY check ----------------------------------------
+    // POST_ONLY: reject if it would cross immediately.
     if (incoming.type == OrderType::POST_ONLY) {
         if (book_.would_cross(incoming)) {
             incoming.status = OrderStatus::REJECTED;
             return {};
         }
-        // Falls through to GTC rest logic below (no matching attempt)
+        // Falls through to GTC rest logic (no match attempted).
     }
 
-    // ---------- FOK pre-check ------------------------------------------
+    // FOK pre-check: sufficient depth must exist before we attempt any fills.
     if (incoming.tif == TIF::FOK) {
         double avail = book_.available_qty(incoming.side, incoming.price);
         if (avail < incoming.remaining_qty - 1e-9) {
@@ -254,17 +299,16 @@ std::vector<Trade> MatchingEngine::process(Order& incoming, double mark_price) {
         }
     }
 
-    // ---------- Matching loop ------------------------------------------
+    // Matching loop.
     std::vector<Trade> trades;
     if (incoming.type != OrderType::POST_ONLY) {
         trades = try_match(incoming, mark_price);
     }
 
-    // ---------- Handle residual qty ------------------------------------
+    // Handle residual qty.
     if (incoming.remaining_qty > 1e-9) {
         switch (incoming.tif) {
             case TIF::GTC:
-                // Rest in book
                 incoming.status = OrderStatus::OPEN;
                 book_.add_order(incoming);
                 reserve_order_margin(user, incoming, mark_price);
@@ -272,12 +316,13 @@ std::vector<Trade> MatchingEngine::process(Order& incoming, double mark_price) {
                 break;
             case TIF::IOC:
             case TIF::FOK:
-                // Cancel remainder
-                incoming.status = trades.empty() ? OrderStatus::CANCELLED : OrderStatus::PARTIAL;
+                incoming.status = trades.empty() ? OrderStatus::CANCELLED
+                                                 : OrderStatus::PARTIAL;
                 break;
         }
-        // POST_ONLY with GTC tif rests in book (already handled above; no match attempted)
-        if (incoming.type == OrderType::POST_ONLY && incoming.tif == TIF::GTC
+        // POST_ONLY GTC that passed the crossing check rests here.
+        if (incoming.type == OrderType::POST_ONLY
+                && incoming.tif == TIF::GTC
                 && incoming.status != OrderStatus::OPEN) {
             incoming.status = OrderStatus::OPEN;
             book_.add_order(incoming);
@@ -288,9 +333,7 @@ std::vector<Trade> MatchingEngine::process(Order& incoming, double mark_price) {
         incoming.status = OrderStatus::FILLED;
     }
 
-    // Increment rate limit counter
     user.messages_this_sec++;
-
     return trades;
 }
 

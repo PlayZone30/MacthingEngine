@@ -127,7 +127,7 @@ include(Catch)
 catch_discover_tests(tests)
 
 # ---------------------------------------------------------------------------
-# Latency benchmark
+# Latency benchmark (full pipeline)
 # ---------------------------------------------------------------------------
 add_executable(bench_latency bench/bench_latency.cpp)
 
@@ -139,9 +139,21 @@ target_include_directories(bench_latency PRIVATE
 target_link_libraries(bench_latency PRIVATE engine_lib pthread)
 
 # ---------------------------------------------------------------------------
+# Raw book benchmark (OrderBook layer only — no account/margin/sequencer)
+# ---------------------------------------------------------------------------
+add_executable(bench_rawbook bench/bench_rawbook.cpp)
+
+target_include_directories(bench_rawbook PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${NLOHMANN_INCLUDE}
+    ${CONCURRENTQUEUE_INCLUDE})
+
+target_link_libraries(bench_rawbook PRIVATE engine_lib pthread)
+
+# ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-foreach(tgt engine_lib sim tests bench_latency)
+foreach(tgt engine_lib sim tests bench_latency bench_rawbook)
     target_compile_options(${tgt} PRIVATE
         $<$<CONFIG:Release>:-O3 -march=native>
         $<$<CONFIG:Debug>:-g -fsanitize=address>
